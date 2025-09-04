@@ -4,31 +4,32 @@ on:
   workflow_dispatch:
     inputs:
       # Option A (preferred): paste the exact WSL kernel tag from MS releases
-      # e.g. linux-msft-wsl-6.6.87.2  or  linux-msft-wsl-5.15.153.1
+      #   e.g. linux-msft-wsl-6.6.87.2  or  linux-msft-wsl-5.15.153.1
       wsl_kernel_tag:
         description: "Exact WSL kernel tag"
         required: false
-      # Option B: paste `uname -r` from WSL, we derive the tag (e.g., 6.6.87.2-microsoft-standard-WSL2)
+      # Option B: paste `uname -r` from WSL; we derive the tag
+      #   e.g. 6.6.87.2-microsoft-standard-WSL2
       kernel_release:
-        description: "uname -r from WSL (e.g., 6.6.87.2-microsoft-standard-WSL2)"
+        description: "uname -r from WSL"
         required: false
-      # Driver repo/branch (defaults to cfg80211-based 8188eu)
+      # Driver repo/branch (defaults to cfg80211-based branch that works on WSL 6.x)
       driver_repo:
         description: "Driver repo URL"
+        required: false
         default: "https://github.com/lwfinger/rtl8188eu"
-        required: false
       driver_branch:
-        description: "Driver branch/tag"
+        description: "Driver branch/tag to checkout"
+        required: false
         default: "v5.2.2.4"
-        required: false
       module_name:
-        description: "Module name label (artifact)"
+        description: "Module name label for artifact"
+        required: false
         default: "8188eu"
-        required: false
       retention_days:
-        description: "Artifact retention (<= repo/org cap)"
-        default: "30"
+        description: "Artifact retention (cannot exceed repo/org cap)"
         required: false
+        default: "30"
 
 permissions:
   contents: read
@@ -57,24 +58,25 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Install build deps
+      - name: Install build dependencies
+        shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential bc bison flex libssl-dev libelf-dev dwarves \
-            wget tar xz-utils git ccache
+            wget tar xz-utils git
 
-      - name: Fetch WSL kernel source (${ { steps.tag.outputs.tag } })
+      - name: Fetch matching WSL kernel sources
+        shell: bash
         run: |
           wget -q "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/${{ steps.tag.outputs.tag }}.tar.gz" -O wsl-kernel.tar.gz
           tar -xf wsl-kernel.tar.gz
-          echo "KDIR=$(echo WSL2-Linux-Kernel-*)" >> $GITHUB_ENV
+          echo "KDIR=$(echo WSL2-Linux-Kernel-*)" >> "$GITHUB_ENV"
 
       - name: Configure WSL kernel (use config-wsl)
         shell: bash
         run: |
           cd "$KDIR"
-          # Prefer arch path; fall back to Microsoft/ path if present in this tag
           if [[ -f arch/x86/configs/config-wsl ]]; then
             cp arch/x86/configs/config-wsl .config
           elif [[ -f Microsoft/config-wsl ]]; then
@@ -83,16 +85,18 @@ jobs:
             echo "Could not find config-wsl in this kernel tag." >&2
             exit 1
           fi
-          yes "" | make olddefconfig
+          make olddefconfig
 
-      - name: Build kernel (to generate Module.symvers)
-        # NOTE: modules_prepare does NOT create Module.symvers; we must build.
-        # We also set LOCALVERSION to match '-microsoft-standard-WSL2'.
+      - name: Build kernel modules (to generate Module.symvers)
+        shell: bash
         run: |
           cd "$KDIR"
+          # LOCALVERSION ensures vermagic like '-microsoft-standard-WSL2'
           make -j"$(nproc)" LOCALVERSION=-microsoft-standard-WSL2 modules
+          test -f Module.symvers || { echo "Module.symvers not generated"; exit 1; }
 
       - name: Clone driver (rtl8188eu)
+        shell: bash
         run: |
           git clone "${{ github.event.inputs.driver_repo }}" driver
           cd driver
@@ -115,6 +119,7 @@ jobs:
           make -C "$KDIR" M="$GITHUB_WORKSPACE/driver" LOCALVERSION=-microsoft-standard-WSL2 modules
 
       - name: Collect artifacts
+        shell: bash
         run: |
           mkdir -p out
           find driver -name "*.ko" -print -exec cp {} out/ \;
