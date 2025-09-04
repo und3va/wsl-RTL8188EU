@@ -1,35 +1,47 @@
-name: Build Realtek driver for WSL kernel
+name: Build RTL8188EU driver for WSL
 
 on:
   workflow_dispatch:
     inputs:
-      # Option A (preferred): paste the exact WSL kernel tag from MS releases
+      # Option A (preferred): paste the exact WSL kernel tag from Microsoft's WSL kernel releases
+      # e.g. linux-msft-wsl-6.6.87.2  or  linux-msft-wsl-5.15.153.1
       wsl_kernel_tag:
-        description: "Exact WSL kernel tag (e.g., linux-msft-wsl-5.15.153.1 or linux-msft-wsl-6.6.36.1)"
+        description: "Exact WSL kernel tag (e.g., linux-msft-wsl-6.6.87.2)"
         required: false
-      # Option B: paste your uname -r from WSL; we derive the tag prefix
+      # Option B: paste `uname -r` from Kali WSL, we derive the tag (e.g., 6.6.87.2-microsoft-standard-WSL2)
       kernel_release:
-        description: "uname -r from WSL (e.g., 5.15.153.1-microsoft-standard-WSL2)"
+        description: "uname -r from WSL (e.g., 6.6.87.2-microsoft-standard-WSL2)"
         required: false
-      # Which driver repo to build (defaults to rtl8188eu for your dongle)
+      # Driver repo/branch (defaults to rtl8188eu v5.2.2.4)
       driver_repo:
-        description: "Git repo URL of the driver (e.g., https://github.com/lwfinger/rtl8188eu)"
+        description: "Driver repo URL"
         required: false
         default: "https://github.com/lwfinger/rtl8188eu"
-      # Just for artifact naming
+      driver_branch:
+        description: "Driver branch/tag to checkout"
+        required: false
+        default: "v5.2.2.4"
       module_name:
-        description: "Module name label (e.g., rtl8188eu)"
-        required: true
-        default: "rtl8188eu"
+        description: "Module name label for artifact"
+        required: false
+        default: "8188eu"
+      retention_days:
+        description: "Artifact retention days (cannot exceed repo/org cap)"
+        required: false
+        default: "30"
 
 permissions:
-  contents: read  # checkout & downloads need only read
+  contents: read
+
+concurrency:
+  group: wsl-rtl8188eu-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve WSL kernel tag
+      - name: Resolve kernel tag
         id: tag
         shell: bash
         run: |
@@ -37,22 +49,24 @@ jobs:
             TAG="${{ github.event.inputs.wsl_kernel_tag }}"
           elif [[ -n "${{ github.event.inputs.kernel_release }}" ]]; then
             base="${{ github.event.inputs.kernel_release }}"
-            base="${base%%-*}"                               # keep '6.6.36.1' from '6.6.36.1-microsoft-standard-WSL2'
-            TAG="linux-msft-wsl-${base}"                     # -> linux-msft-wsl-6.6.36.1
+            base="${base%%-*}"   # 6.6.87.2-microsoft-standard-WSL2 -> 6.6.87.2
+            TAG="linux-msft-wsl-${base}"
           else
-            echo "Provide either wsl_kernel_tag or kernel_release." >&2
+            echo "Provide wsl_kernel_tag OR kernel_release." >&2
             exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Install build deps
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev dwarves wget tar xz-utils git
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev dwarves \
+            wget tar xz-utils git
 
       - name: Fetch matching WSL kernel sources
         run: |
-          wget -q https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/${{ steps.tag.outputs.tag }}.tar.gz -O wsl-kernel.tar.gz
+          wget -q "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/${{ steps.tag.outputs.tag }}.tar.gz" -O wsl-kernel.tar.gz
           tar -xf wsl-kernel.tar.gz
           echo "KDIR=$(echo WSL2-Linux-Kernel-*)" >> $GITHUB_ENV
 
@@ -62,35 +76,48 @@ jobs:
           make olddefconfig
           make modules_prepare
 
-      - name: Fetch driver source
+      - name: Clone driver
         run: |
           git clone "${{ github.event.inputs.driver_repo }}" driver
-          ls -la driver
+          cd driver
+          git fetch --all --tags
+          BR="${{ github.event.inputs.driver_branch }}"
+          # Try local branch, then remote, else fail
+          if git rev-parse --verify --quiet "$BR"; then
+            git checkout "$BR"
+          elif git show-ref --verify --quiet "refs/remotes/origin/$BR"; then
+            git checkout -b "$BR" "origin/$BR"
+          else
+            echo "Branch/tag '$BR' not found in repo." >&2
+            exit 1
+          fi
 
-      - name: Build driver (try Kbuild M=... first, then fallback to KSRC=)
+      - name: Build module (Kbuild out-of-tree)
         shell: bash
         run: |
           set -e
-          # Try standard out-of-tree build via Kbuild
+          export EXTRA_CFLAGS="-Wno-error"
           if make -C "$KDIR" M="$GITHUB_WORKSPACE/driver" modules; then
             echo "Built via Kbuild M=driver"
           else
-            echo "Kbuild M=driver failed; trying repo's own Makefile with KSRC ..."
-            make -C driver KSRC="$GITHUB_WORKSPACE/$KDIR"
+            echo "Kbuild failed; trying repo Makefile with KSRC ..."
+            make -C driver KSRC="$GITHUB_WORKSPACE/$KDIR" modules
           fi
 
-      - name: Collect .ko artifacts
+      - name: Collect artifacts
         run: |
           mkdir -p out
           find driver -name "*.ko" -print -exec cp {} out/ \;
-          # Add kernel tag to filenames for clarity
+          # Tag the filename with the kernel tag for clarity
           for f in out/*.ko; do
-            mv "$f" "${f%.ko}-${{ steps.tag.outputs.tag }}.ko"
+            base=$(basename "$f")
+            mv "$f" "out/${base%.ko}-${{ steps.tag.outputs.tag }}.ko"
           done
           ls -la out
 
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: "${{ github.event.inputs.module_name }}-${{ steps.tag.outputs.tag }}"
           path: out/*.ko
+          retention-days: ${{ github.event.inputs.retention_days }}
