@@ -3,38 +3,38 @@ name: Build RTL8188EU driver for WSL
 on:
   workflow_dispatch:
     inputs:
-      # Option A (preferred): paste the exact WSL kernel tag from Microsoft's WSL kernel releases
+      # Option A (preferred): paste the exact WSL kernel tag from MS releases
       # e.g. linux-msft-wsl-6.6.87.2  or  linux-msft-wsl-5.15.153.1
       wsl_kernel_tag:
-        description: "Exact WSL kernel tag (e.g., linux-msft-wsl-6.6.87.2)"
+        description: "Exact WSL kernel tag"
         required: false
-      # Option B: paste `uname -r` from Kali WSL, we derive the tag (e.g., 6.6.87.2-microsoft-standard-WSL2)
+      # Option B: paste `uname -r` from WSL, we derive the tag (e.g., 6.6.87.2-microsoft-standard-WSL2)
       kernel_release:
         description: "uname -r from WSL (e.g., 6.6.87.2-microsoft-standard-WSL2)"
         required: false
-      # Driver repo/branch (defaults to rtl8188eu v5.2.2.4)
+      # Driver repo/branch (defaults to cfg80211-based 8188eu)
       driver_repo:
         description: "Driver repo URL"
-        required: false
         default: "https://github.com/lwfinger/rtl8188eu"
+        required: false
       driver_branch:
-        description: "Driver branch/tag to checkout"
-        required: false
+        description: "Driver branch/tag"
         default: "v5.2.2.4"
+        required: false
       module_name:
-        description: "Module name label for artifact"
-        required: false
+        description: "Module name label (artifact)"
         default: "8188eu"
-      retention_days:
-        description: "Artifact retention days (cannot exceed repo/org cap)"
         required: false
+      retention_days:
+        description: "Artifact retention (<= repo/org cap)"
         default: "30"
+        required: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: wsl-rtl8188eu-${{ github.ref }}
+  group: wsl8188eu-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -57,32 +57,47 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Install build dependencies
+      - name: Install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential bc bison flex libssl-dev libelf-dev dwarves \
-            wget tar xz-utils git
+            wget tar xz-utils git ccache
 
-      - name: Fetch matching WSL kernel sources
+      - name: Fetch WSL kernel source (${ { steps.tag.outputs.tag } })
         run: |
           wget -q "https://github.com/microsoft/WSL2-Linux-Kernel/archive/refs/tags/${{ steps.tag.outputs.tag }}.tar.gz" -O wsl-kernel.tar.gz
           tar -xf wsl-kernel.tar.gz
           echo "KDIR=$(echo WSL2-Linux-Kernel-*)" >> $GITHUB_ENV
 
-      - name: Prepare kernel headers
+      - name: Configure WSL kernel (use config-wsl)
+        shell: bash
         run: |
           cd "$KDIR"
-          make olddefconfig
-          make modules_prepare
+          # Prefer arch path; fall back to Microsoft/ path if present in this tag
+          if [[ -f arch/x86/configs/config-wsl ]]; then
+            cp arch/x86/configs/config-wsl .config
+          elif [[ -f Microsoft/config-wsl ]]; then
+            cp Microsoft/config-wsl .config
+          else
+            echo "Could not find config-wsl in this kernel tag." >&2
+            exit 1
+          fi
+          yes "" | make olddefconfig
 
-      - name: Clone driver
+      - name: Build kernel (to generate Module.symvers)
+        # NOTE: modules_prepare does NOT create Module.symvers; we must build.
+        # We also set LOCALVERSION to match '-microsoft-standard-WSL2'.
+        run: |
+          cd "$KDIR"
+          make -j"$(nproc)" LOCALVERSION=-microsoft-standard-WSL2 modules
+
+      - name: Clone driver (rtl8188eu)
         run: |
           git clone "${{ github.event.inputs.driver_repo }}" driver
           cd driver
           git fetch --all --tags
           BR="${{ github.event.inputs.driver_branch }}"
-          # Try local branch, then remote, else fail
           if git rev-parse --verify --quiet "$BR"; then
             git checkout "$BR"
           elif git show-ref --verify --quiet "refs/remotes/origin/$BR"; then
@@ -92,23 +107,17 @@ jobs:
             exit 1
           fi
 
-      - name: Build module (Kbuild out-of-tree)
+      - name: Build module against WSL kernel
         shell: bash
         run: |
           set -e
           export EXTRA_CFLAGS="-Wno-error"
-          if make -C "$KDIR" M="$GITHUB_WORKSPACE/driver" modules; then
-            echo "Built via Kbuild M=driver"
-          else
-            echo "Kbuild failed; trying repo Makefile with KSRC ..."
-            make -C driver KSRC="$GITHUB_WORKSPACE/$KDIR" modules
-          fi
+          make -C "$KDIR" M="$GITHUB_WORKSPACE/driver" LOCALVERSION=-microsoft-standard-WSL2 modules
 
       - name: Collect artifacts
         run: |
           mkdir -p out
           find driver -name "*.ko" -print -exec cp {} out/ \;
-          # Tag the filename with the kernel tag for clarity
           for f in out/*.ko; do
             base=$(basename "$f")
             mv "$f" "out/${base%.ko}-${{ steps.tag.outputs.tag }}.ko"
